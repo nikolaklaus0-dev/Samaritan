@@ -423,52 +423,87 @@ async function loadSession() {
             throw new Error("❌ SESSION_ID is missing or invalid");
         }
 
-        // New format: "KLAUS XMD:<short_code>" — exactly 30 chars total
-        //   "KLAUS XMD:" is 10 chars, short_code is 20 chars
+        // Session ID format: "KLAUS XMD:<payload>"
+        // Three payload formats are supported:
+        //   1. ".<base64_json>"       — base64 of JSON creds (with leading dot)
+        //                              Used by klausxmdpair.pairsite.space
+        //   2. "H4sI<base64_gzip>"    — gzipped base64 (starts with H4sI = gzip magic)
+        //   3. "<short_code>"         — 20-char short code, fetches full session
+        //                              from pairing server (≤30 chars total)
         const SESSION_PREFIX = "KLAUS XMD:";
         const rawSession = config.SESSION_ID.trim();
-        const MAX_LENGTH = 30;
 
         if (!rawSession.startsWith(SESSION_PREFIX)) {
             throw new Error(`❌ Invalid session format. Session ID must start with '${SESSION_PREFIX}'`);
         }
 
-        if (rawSession.length > MAX_LENGTH) {
-            throw new Error(`❌ Session ID too long (max ${MAX_LENGTH} chars). Got ${rawSession.length}.`);
+        let payload = rawSession.slice(SESSION_PREFIX.length).trim();
+        if (!payload) {
+            throw new Error(`❌ Invalid session format. Missing session data after '${SESSION_PREFIX}'`);
         }
 
-        // Extract the short code after the prefix
-        const sessionCode = rawSession.slice(SESSION_PREFIX.length).trim();
-        if (!sessionCode) {
-            throw new Error(`❌ Invalid session format. Missing session code after '${SESSION_PREFIX}'`);
-        }
+        let credsJson;
 
-        let fullSessionId = rawSession;
+        // Helper: try decoding a payload (after stripping leading dot if present)
+        // as base64 → JSON creds string
+        const decodeBase64Json = (b64) => {
+            const decoded = Buffer.from(b64, 'base64');
+            const text = decoded.toString('utf8');
+            // Validate it's parseable JSON
+            JSON.parse(text);
+            return text;
+        };
 
-        // If the session code doesn't start with H4sI (gzip magic), treat it as a short code
-        // and fetch the full session from the pairing server
-        if (!sessionCode.startsWith('H4sI')) {
-            const serverUrl = `https://klausxmdpair.pairsite.space/session/${encodeURIComponent(sessionCode)}`;
+        // Helper: decode a gzipped base64 payload (starts with H4sI)
+        const decodeGzippedBase64 = (b64) => {
+            const cleanB64 = b64.replace('...', '');
+            const compressedData = Buffer.from(cleanB64, 'base64');
+            const decompressedData = zlib.gunzipSync(compressedData);
+            const text = decompressedData.toString('utf8');
+            JSON.parse(text);  // validate
+            return text;
+        };
+
+        if (payload.startsWith('H4sI')) {
+            // Format 2: gzipped base64 (original Gifted format)
+            console.log("ℹ️  Session format: gzipped base64 (H4sI)");
+            credsJson = decodeGzippedBase64(payload);
+        } else if (payload.startsWith('.')) {
+            // Format 1: base64 of JSON with leading dot (your pairing site format)
+            console.log("ℹ️  Session format: base64 JSON with dot delimiter");
+            credsJson = decodeBase64Json(payload.slice(1));
+        } else if (rawSession.length <= 30) {
+            // Format 3: short code — fetch full session from pairing server
+            console.log("ℹ️  Session format: short code, fetching from pairing server...");
+            const serverUrl = `https://klausxmdpair.pairsite.space/session/${encodeURIComponent(payload)}`;
             const res = await axios.get(serverUrl, { timeout: 15000 });
             const fetched = (res.data || '').toString().trim();
-            if (!fetched.startsWith(SESSION_PREFIX + 'H4sI')) {
-                throw new Error("❌ Session server returned invalid data. Expected full session starting with 'KLAUS XMD:H4sI'");
+            if (!fetched.startsWith(SESSION_PREFIX)) {
+                throw new Error("❌ Pairing server returned invalid data. Expected response starting with 'KLAUS XMD:'");
             }
-            fullSessionId = fetched;
+            const fetchedPayload = fetched.slice(SESSION_PREFIX.length).trim();
+            if (fetchedPayload.startsWith('H4sI')) {
+                credsJson = decodeGzippedBase64(fetchedPayload);
+            } else if (fetchedPayload.startsWith('.')) {
+                credsJson = decodeBase64Json(fetchedPayload.slice(1));
+            } else {
+                throw new Error("❌ Pairing server returned unsupported payload format");
+            }
+        } else {
+            // Format 4: plain base64 of JSON (no dot, no H4sI)
+            console.log("ℹ️  Session format: plain base64 JSON");
+            try {
+                credsJson = decodeBase64Json(payload);
+            } catch (e) {
+                throw new Error(`❌ Unsupported session format. Payload starts with: '${payload.slice(0, 20)}...'`);
+            }
         }
-
-        // At this point, fullSessionId is "KLAUS XMD:H4sI<base64_gzip_data>"
-        const b64data = fullSessionId.slice(SESSION_PREFIX.length);
-
-        const cleanB64 = b64data.replace('...', '');
-        const compressedData = Buffer.from(cleanB64, 'base64');
-        const decompressedData = zlib.gunzipSync(compressedData);
 
         if (!fs.existsSync(sessionDir)) {
             fs.mkdirSync(sessionDir, { recursive: true });
         }
 
-        fs.writeFileSync(sessionPath, decompressedData, "utf8");
+        fs.writeFileSync(sessionPath, credsJson, "utf8");
         console.log("✅ Session File Loaded");
 
     } catch (e) {
