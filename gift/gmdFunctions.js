@@ -423,28 +423,42 @@ async function loadSession() {
             throw new Error("❌ SESSION_ID is missing or invalid");
         }
 
-        let sessionId = config.SESSION_ID;
-        const [headerCheck, b64Check] = sessionId.split('~');
+        // New format: "KLAUS XMD:<short_code>" — exactly 30 chars total
+        //   "KLAUS XMD:" is 10 chars, short_code is 20 chars
+        const SESSION_PREFIX = "KLAUS XMD:";
+        const rawSession = config.SESSION_ID.trim();
+        const MAX_LENGTH = 30;
 
-        if (headerCheck !== "Klaus" || !b64Check) {
-            throw new Error("❌ Invalid session format. Session ID must start with 'Klaus~'");
+        if (!rawSession.startsWith(SESSION_PREFIX)) {
+            throw new Error(`❌ Invalid session format. Session ID must start with '${SESSION_PREFIX}'`);
         }
 
-        if (!b64Check.startsWith('H4sI')) {
-            const serverUrl = `https://klausxmdpair.pairsite.space/session/${b64Check}`;
+        if (rawSession.length > MAX_LENGTH) {
+            throw new Error(`❌ Session ID too long (max ${MAX_LENGTH} chars). Got ${rawSession.length}.`);
+        }
+
+        // Extract the short code after the prefix
+        const sessionCode = rawSession.slice(SESSION_PREFIX.length).trim();
+        if (!sessionCode) {
+            throw new Error(`❌ Invalid session format. Missing session code after '${SESSION_PREFIX}'`);
+        }
+
+        let fullSessionId = rawSession;
+
+        // If the session code doesn't start with H4sI (gzip magic), treat it as a short code
+        // and fetch the full session from the pairing server
+        if (!sessionCode.startsWith('H4sI')) {
+            const serverUrl = `https://klausxmdpair.pairsite.space/session/${encodeURIComponent(sessionCode)}`;
             const res = await axios.get(serverUrl, { timeout: 15000 });
             const fetched = (res.data || '').toString().trim();
-            if (!fetched.startsWith('Klaus~H4sI')) {
-                throw new Error("❌ Session server returned invalid data");
+            if (!fetched.startsWith(SESSION_PREFIX + 'H4sI')) {
+                throw new Error("❌ Session server returned invalid data. Expected full session starting with 'KLAUS XMD:H4sI'");
             }
-            sessionId = fetched;
+            fullSessionId = fetched;
         }
 
-        const [header, b64data] = sessionId.split('~');
-
-        if (header !== "Klaus" || !b64data) {
-            throw new Error("❌ Invalid session format. Session ID must start with 'Klaus~'");
-        }
+        // At this point, fullSessionId is "KLAUS XMD:H4sI<base64_gzip_data>"
+        const b64data = fullSessionId.slice(SESSION_PREFIX.length);
 
         const cleanB64 = b64data.replace('...', '');
         const compressedData = Buffer.from(cleanB64, 'base64');

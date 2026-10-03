@@ -28,11 +28,11 @@
 
 ### Setup
 
-1. **Pair** — click <kbd>Pair</kbd> above, scan the QR with WhatsApp, copy the `Klaus~...` session ID
+1. **Pair** — click <kbd>Pair</kbd> above, scan the QR with WhatsApp, copy the `KLAUS XMD:...` session ID
 2. **Fork** — click <kbd>Repo</kbd> above, then **Fork** the repo to your account
 3. **Deploy** — click <kbd>Heroku</kbd> or <kbd>Render</kbd> above, paste your `SESSION_ID` when prompted
 
-> ⚠️ Session ID must start with `Klaus~`
+> ⚠️ Session ID format: `KLAUS XMD:<20-char-code>` (exactly 30 characters total)
 
 ---
 
