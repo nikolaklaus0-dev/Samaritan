@@ -1,4 +1,66 @@
 require("events").EventEmitter.defaultMaxListeners = 960;
+
+// ──────────────────────────────────────────────────────────────────────
+// Top-of-file: install process error handlers BEFORE any other require
+// so we never miss an unhandled rejection during startup.
+// ──────────────────────────────────────────────────────────────────────
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('════════════════════════════════════════════════════════');
+    console.error('🚨 UNHANDLED REJECTION at:', promise);
+    console.error('🚨 Reason:', reason?.stack || reason?.message || reason);
+    console.error('🚨 Continuing to run, but this likely indicates a bug.');
+    console.error('════════════════════════════════════════════════════════');
+});
+process.on('uncaughtException', (err) => {
+    console.error('════════════════════════════════════════════════════════');
+    console.error('🚨 UNCAUGHT EXCEPTION:', err?.stack || err?.message || err);
+    console.error('🚨 Bot will exit in 3s to let Heroku restart the dyno cleanly.');
+    console.error('════════════════════════════════════════════════════════');
+    setTimeout(() => process.exit(1), 3000);
+});
+
+// Loud structured startup log — appears at the very top of `heroku logs`
+console.log('');
+console.log('════════════════════════════════════════════════════════');
+console.log(`🟢 KLAUS-XMD booting at ${new Date().toISOString()}`);
+console.log(`🟢 Node version: ${process.version}`);
+console.log(`🟢 Platform:    ${process.platform} ${process.arch}`);
+console.log(`🟢 Memory cap:  ${Math.round(require('v8').getHeapStatistics().heap_size_limit / 1024 / 1024)} MB heap`);
+console.log(`🟢 Process PID: ${process.pid}`);
+console.log(`🟢 Working dir: ${process.cwd()}`);
+// Log which env var NAMES are set — NEVER log values (especially SESSION_ID)
+const envVarNames = Object.keys(process.env).filter(k =>
+    !k.toLowerCase().includes('secret') &&
+    !k.toLowerCase().includes('token') &&
+    !k.toLowerCase().includes('password') &&
+    !k.toLowerCase().includes('key')
+);
+console.log(`🟢 Env vars set: ${envVarNames.join(', ') || '(none)'}`);
+console.log('════════════════════════════════════════════════════════');
+console.log('');
+
+// Watchdog: if the socket hasn't reached "open" within 90s, log WHY.
+let socketOpened = false;
+let bootStartTime = Date.now();
+const watchdog = setTimeout(() => {
+    if (socketOpened) return;
+    const elapsed = Math.round((Date.now() - bootStartTime) / 1000);
+    console.error('════════════════════════════════════════════════════════');
+    console.error(`🔴 WATCHDOG: socket has NOT reached "open" within ${elapsed}s`);
+    console.error('🔴 Most likely causes (in order):');
+    console.error('   1. SESSION_ID is invalid or expired → generate a new one at');
+    console.error('      https://klausxmdpair.pairsite.space');
+    console.error('   2. The pair site is still polling with your creds → log it out');
+    console.error('      there first, then redeploy');
+    console.error('   3. Heroku IP blocked by WhatsApp → try a VPS deploy');
+    console.error('   4. Bad build — check the build logs for missing native modules');
+    console.error('   5. Database connection hung → check DATABASE_URL or fall back to SQLite');
+    console.error('🔴 The process is still alive but the socket is stuck. Will keep waiting.');
+    console.error('════════════════════════════════════════════════════════');
+}, 90000);
+// Allow the process to stay alive even if the express server is the only thing running
+watchdog.unref();
+
 require("./gift/gmdHelpers");
 
 const {
@@ -211,7 +273,27 @@ async function startKlaus() {
                         const totalCommands = commands.filter(
                             (c) => c.pattern && !c.dontAddCommandList,
                         ).length;
-                        console.log("💜 Connected to Whatsapp, Active!");
+                        // Mark watchdog as satisfied
+                        socketOpened = true;
+                        const myPhone = Klaus.user.id.split(':')[0].split('@')[0];
+                        console.log(`💜 Connected to WhatsApp, Active!`);
+                        console.log(`💜 Bot phone: ${myPhone}`);
+                        console.log(`💜 Bot JID:   ${Klaus.user.id}`);
+
+                        // Always send a confirmation message to the first owner number.
+                        // This is the "I'm alive" signal the user wants on Heroku deploy.
+                        try {
+                            const ownerNumber = (s.OWNER_NUMBER || DEFAULT_SETTINGS.OWNER_NUMBER || '').replace(/\D/g, '');
+                            const ownerJid = ownerNumber ? `${ownerNumber}@s.whatsapp.net` : Klaus.user.id;
+                            const now = new Date();
+                            const tz = s.TIME_ZONE || DEFAULT_SETTINGS.TIME_ZONE || 'Africa/Nairobi';
+                            const localTime = now.toLocaleString('en-GB', { timeZone: tz, hour12: false });
+                            const confirmMsg = `🟢 ${s.BOT_NAME || 'KLAUS-XMD'} connected on Heroku\n\nTime: ${localTime} (${tz})\nPhone: ${myPhone}\nPlugins: ${totalCommands}\nPrefix: ${s.PREFIX || DEFAULT_SETTINGS.PREFIX}\nMode: ${s.MODE === 'private' ? 'private' : 'public'}\n\n> ${s.FOOTER || DEFAULT_SETTINGS.FOOTER}`;
+                            await Klaus.sendMessage(ownerJid, { text: confirmMsg });
+                            console.log(`✅ Sent "connected on Heroku" confirmation to ${ownerJid}`);
+                        } catch (e) {
+                            console.error(`⚠️  Could not send confirmation message: ${e.message}`);
+                        }
 
                         if (s.STARTING_MESSAGE === "true") {
                             const d = DEFAULT_SETTINGS;
@@ -256,10 +338,27 @@ async function startKlaus() {
             },
         });
 
-        process.on("SIGINT", () => store?.destroy());
-        process.on("SIGTERM", () => store?.destroy());
+        // SIGTERM / SIGINT handlers — Heroku sends SIGTERM to shut down dynos.
+        // We must call Klaus.end() to cleanly close the WebSocket AND call
+        // process.exit() so Heroku doesn't SIGKILL us.
+        const shutdown = async (signal) => {
+            console.log(`📵 Received ${signal}, shutting down...`);
+            try {
+                if (Klaus?.end) await Klaus.end();
+                if (store?.destroy) await store.destroy();
+            } catch (e) {
+                console.error('Shutdown error:', e.message);
+            }
+            console.log(`✅ Shutdown complete, exiting.`);
+            process.exit(0);
+        };
+        process.on("SIGINT", () => shutdown('SIGINT'));
+        process.on("SIGTERM", () => shutdown('SIGTERM'));
     } catch (error) {
-        console.error("Socket initialization error:", error);
+        console.error("════════════════════════════════════════════════════════");
+        console.error("🔴 Socket initialization error:", error?.stack || error?.message || error);
+        console.error("🔴 Will retry in 5s. Heroku will see this as a soft failure.");
+        console.error("════════════════════════════════════════════════════════");
         setTimeout(() => startKlaus(), 5000);
     }
 }
@@ -635,6 +734,31 @@ function setupCommandHandler(Klaus) {
         if (messageTimestamp && messageTimestamp < BOT_START_TIME - 5000)
             return;
 
+        // ── Per-message structured log ──────────────────────────────────
+        // Helps debug "bot active but not responding" — every incoming
+        // message is logged with sender, chat, fromMe, and a text preview.
+        // Never logs credentials — these are just WhatsApp message metadata.
+        try {
+            const fromJid = ms.key.remoteJid || '?';
+            const senderJid = ms.key.participant || ms.key.remoteJid || '?';
+            const fromMe = ms.key.fromMe === true;
+            // Get a short text preview (max 40 chars) — safe to log
+            let textPreview = '';
+            const msg = ms.message;
+            if (msg) {
+                if (msg.conversation) textPreview = msg.conversation;
+                else if (msg.extendedTextMessage?.text) textPreview = msg.extendedTextMessage.text;
+                else if (msg.imageMessage?.caption) textPreview = msg.imageMessage.caption;
+                else if (msg.videoMessage?.caption) textPreview = msg.videoMessage.caption;
+                else textPreview = `[${Object.keys(msg)[0] || 'unknown type'}]`;
+            }
+            textPreview = (textPreview || '').toString().slice(0, 40).replace(/\n/g, ' ');
+            const chatType = fromJid.endsWith('@g.us') ? 'group' :
+                              fromJid.endsWith('@s.whatsapp.net') ? 'dm' :
+                              fromJid.endsWith('@newsletter') ? 'newsletter' : 'other';
+            console.log(`📩 MSG [${chatType}] from=${senderJid.split('@')[0]} chat=${fromJid.split('@')[0]} fromMe=${fromMe} preview="${textPreview}"`);
+        } catch (_) {}
+
         const settings = await getAllSettings();
         const botId = standardizeJid(Klaus.user?.id);
 
@@ -752,10 +876,17 @@ function setupCommandHandler(Klaus) {
 
         if (isCommand && command) {
             const gmd = findCommand(command);
-            if (!gmd) return;
-
-            if (settings.MODE?.toLowerCase() === "private" && !isSuperUser)
+            if (!gmd) {
+                console.log(`❓ No command found for ".${command}" (from ${from.split('@')[0]})`);
                 return;
+            }
+
+            console.log(`⚡ CMD .${command} matched (from ${from.split('@')[0]}, isSuperUser=${isSuperUser}, category=${gmd.category || '?'})`);
+
+            if (settings.MODE?.toLowerCase() === "private" && !isSuperUser) {
+                console.log(`🚫 Private mode — .${command} blocked (sender not super-user)`);
+                return;
+            }
 
             try {
                 const helpers = createHelpers(Klaus, ms, from);
@@ -982,7 +1113,23 @@ function buildContext(ms, settings, helpers, data) {
 }
 
 (async () => {
-    await loadSession();
-    await loadBotSettings();
-    startKlaus();
+    try {
+        console.log('──────── Boot phase 1: loadSession ────────');
+        await loadSession();
+        console.log('──────── Boot phase 2: loadBotSettings ────────');
+        await loadBotSettings();
+        console.log('──────── Boot phase 3: startKlaus ────────');
+        startKlaus();
+        console.log('──────── Boot phases complete, waiting for socket to open ────────');
+    } catch (e) {
+        console.error('════════════════════════════════════════════════════════');
+        console.error('🔴 BOOT FAILURE:', e?.stack || e?.message || e);
+        console.error('🔴 The bot could not start. Common causes:');
+        console.error('🔴   1. SESSION_ID is missing or invalid — check the .env / Heroku config var');
+        console.error('🔴   2. Database connection failed — check DATABASE_URL');
+        console.error('🔴   3. Native module build failed — check the build logs');
+        console.error('🔴 Process will exit in 5s so Heroku can restart cleanly.');
+        console.error('════════════════════════════════════════════════════════');
+        setTimeout(() => process.exit(1), 5000);
+    }
 })();

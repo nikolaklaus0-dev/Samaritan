@@ -4,9 +4,13 @@
   "description": "KLAUS-XMD, a Multi Device WhatsApp Bot",
   "main": "./index.js",
   "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
-    "dev": "node index.js",
+    "dev": "node --no-warnings --max-old-space-size=512 index.js",
     "start": "pm2 start index.js --deep-monitoring --attach --name klausxmd",
+    "heroku": "node --no-warnings --max-old-space-size=512 index.js",
     "stop": "pm2 stop klausxmd",
     "restart": "pm2 restart klausxmd && pm2 logs",
     "stash": "git stash && git stash drop"

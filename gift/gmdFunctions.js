@@ -506,12 +506,48 @@ async function loadSession() {
             }
         }
 
+        // Validate the decoded creds JSON before writing
+        // This catches malformed/partial sessions early instead of letting Baileys
+        // silently fail to authenticate later.
+        let credsObj;
+        try {
+            credsObj = JSON.parse(credsJson);
+        } catch (e) {
+            throw new Error(`❌ Decoded session is not valid JSON: ${e.message}`);
+        }
+
+        const requiredFields = [
+            'noiseKey', 'signedIdentityKey', 'signedPreKey',
+            'advSecretKey', 'registered', 'me'
+        ];
+        const missing = requiredFields.filter(k => !(k in credsObj));
+        if (missing.length > 0) {
+            throw new Error(`❌ Session creds missing required fields: ${missing.join(', ')}. Generate a new SESSION_ID.`);
+        }
+        if (credsObj.registered !== true) {
+            throw new Error(`❌ Session creds have registered=false. The WhatsApp account is not registered. Generate a new SESSION_ID.`);
+        }
+        // Check nested account signature fields
+        const acct = credsObj.account || {};
+        const missingAcct = ['details', 'accountSignatureKey', 'accountSignature', 'deviceSignature']
+            .filter(k => !(k in acct));
+        if (missingAcct.length > 0) {
+            console.warn(`⚠️  Session creds missing account fields: ${missingAcct.join(', ')}. Bot may not authenticate.`);
+        }
+
+        console.log(`✅ Session creds validated:`);
+        console.log(`     registered: true`);
+        console.log(`     me.id: ${credsObj.me?.id || '?'}`);
+        console.log(`     platform: ${credsObj.platform || '?'}`);
+        console.log(`     registrationId: ${credsObj.registrationId ?? '?'}`);
+        console.log(`     has noiseKey, signedIdentityKey, signedPreKey, advSecretKey ✓`);
+
         if (!fs.existsSync(sessionDir)) {
             fs.mkdirSync(sessionDir, { recursive: true });
         }
 
         fs.writeFileSync(sessionPath, credsJson, "utf8");
-        console.log("✅ Session File Loaded");
+        console.log(`✅ Session File Loaded at ${sessionPath}`);
 
     } catch (e) {
         console.error("❌ Session Error:", e.message);
